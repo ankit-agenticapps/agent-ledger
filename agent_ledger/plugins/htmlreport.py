@@ -94,6 +94,7 @@ button.on{border-color:var(--fg);font-weight:600}
 .row .cost{color:var(--mut);white-space:nowrap}
 .row.deny{background:var(--badbg);border-left-color:var(--bad)}
 .row.deny .act{color:var(--bad);font-weight:600}
+.row.ask .act{color:var(--warn,#b7791f);font-weight:600}
 .row.broken{outline:2px solid var(--bad)}
 .tag{font-size:11px;border-radius:4px;padding:1px 6px;margin-left:6px;border:1px solid var(--ok);color:var(--ok)}
 .sigs{font-size:13px;color:var(--mut)}
@@ -153,8 +154,9 @@ function color(a){var h=0;for(var i=0;i<a.length;i++)h=(h*31+a.charCodeAt(i))%36
 function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!==undefined)e.textContent=x;return e}
 var view="agent",broken=null;
 function isDeny(e){return/^policy:DENY\b/.test(e.action||"")}
+function isAsk(e){return/^policy:ASK\b/.test(e.action||"")}
 function row(it){
- var e=it.e,r=el("div","row"+(isDeny(e)?" deny":"")+(broken&&it.n===broken.n?" broken":""));
+ var e=it.e,r=el("div","row"+(isDeny(e)?" deny":"")+(isAsk(e)?" ask":"")+(broken&&it.n===broken.n?" broken":""));
  r.style.setProperty("--c",color(e.agent||"?"));
  r.appendChild(el("span","n","#"+it.n));
  var a=el("span","act",e.action||"");

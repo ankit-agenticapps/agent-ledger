@@ -12,7 +12,7 @@ def run(args):
         "matcher": "Edit|Write|MultiEdit|Bash",
         "hooks": [{"type": "command",
                    "command": "%s log --agent claude-code --hook-stdin" % cmd}]}]}}
-    print("# Claude Code: merge (PreToolUse = hard-block policy, PostToolUse = log) into ~/.claude/settings.json")
+    print("# Claude Code: merge into ~/.claude/settings.json (PreToolUse = policy: deny blocks, ask prompts you, allow is logged; PostToolUse = log)")
     print(json.dumps(hook, indent=2))
     print()
     print("# Codex: wrap each run (logs start and finish)")

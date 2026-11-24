@@ -21,11 +21,12 @@ both, and records every allow/deny decision in the same chain as the actions.
    `verify --signatures` checks every signature and reports the last signed
    point and the `unsigned tail: N entries`. `anchor --git` writes the head hash
    into a local annotated git tag.
-2. **Policy hard-block.** `agent-ledger policy-check` is a Claude Code
-   PreToolUse hook: it exits 2 with a reason when a rule blocks the call (secret
-   files, `rm -rf` outside the project, force-push to main, `curl | sh`, known
-   secret patterns, per-session budget cap). Every decision, allow or deny, is
-   appended to the chain.
+2. **Policy: deny / ask / allow.** `agent-ledger policy-check` is a Claude Code
+   PreToolUse hook. Each rule has an action: `deny` blocks (exit 2), `ask`
+   makes Claude Code prompt you (exit 0 + PreToolUse JSON), `allow` just logs.
+   Secret files ask; `rm -rf` outside the project, force-push to main,
+   `curl | sh` and sending a secret file over the network deny. Every
+   decision (ALLOW, ASK, DENY, with rule and reason) is appended to the chain.
 3. **HTML report.** `report --html out.html` writes one self-contained file
    (no external requests): timeline grouped by agent, denials highlighted, cost
    totals, signature status, and the chain is re-verified in your browser with
@@ -48,7 +49,7 @@ Wire it into Claude Code:
 
 ```
 agent-ledger policy init     # writes ~/.agent-ledger/policy.json (editable)
-agent-ledger hooks           # prints settings JSON: PreToolUse -> policy-check, PostToolUse -> log
+agent-ledger hooks           # prints settings JSON: PreToolUse -> policy-check (deny/ask/allow), PostToolUse -> log
 ```
 
 ## Signing
@@ -81,25 +82,63 @@ another machine, or a hardware key. `keygen` prints this advice; keep only the
 
 ## Policy
 
-`policy.json` (written by `policy init`; built-in defaults apply if absent):
+`policy init` writes `~/.agent-ledger/policy.json`; `policy explain` shows what
+a call would do; `policy show` prints the active policy.
 
 ```
-{"block_paths": [".env", ".env.*", "*.pem", "id_rsa", "id_ed25519", "~/.ssh", "~/.aws"],
- "allow_paths": [".env.example", ".env.sample"],
- "block_rm_outside_project": true,
- "block_force_push_branches": ["main", "master"],
- "block_pipe_to_shell": true,
- "block_secret_patterns": true,
- "max_cost_usd": 5.0}
+agent-ledger policy init
+echo '{"tool_name":"Read","tool_input":{"file_path":".env"}}' | agent-ledger policy explain
+# ASK  rule=secret-read  agent=claude-code
+# why: Read of '.env' blocked by path rule '.env'
 ```
 
-Budget: costs come from ledger entries tagged with the session id
-(`log --session ID --cost X`; the PostToolUse hook tags automatically). The
-call is blocked when the session total is greater than `max_cost_usd`.
+`explain` reads a hook payload on stdin and writes nothing (no ledger entry).
 
-Decisions look like `policy:DENY Read .env -- Read of '.env' blocked by path
-rule '.env' [session=abc]`. A malformed policy file fails closed (blocks).
-Unparseable hook input is allowed and recorded.
+Each rule has an `id`, a `kind`, an `action` and optional exceptions:
+
+```
+{"rules": [
+  {"id": "secret-read", "kind": "path_read", "action": "ask",
+   "paths": [".env", ".env.*", "*.pem", "id_rsa", "id_ed25519", "~/.ssh", "~/.aws"],
+   "allow_paths": [".env.example", ".env.sample"],
+   "allow": [{"paths": ["{project}/.env"], "agents": ["deploy-bot"]}],
+   "redact_output_note": "Do not repeat secret values in replies."},
+  {"id": "ssh-aws-write", "kind": "path_write", "action": "deny", "paths": ["~/.ssh", "~/.aws"]},
+  {"id": "secret-exfil", "kind": "net_exfil", "action": "deny", "paths": [".env", "~/.ssh"]},
+  {"id": "rm-outside-project", "kind": "rm_outside_project", "action": "deny"},
+  {"id": "force-push-main", "kind": "force_push", "action": "deny", "branches": ["main", "master"]},
+  {"id": "pipe-to-shell", "kind": "pipe_to_shell", "action": "deny"}],
+ "safe_env_read": true, "block_secret_patterns": true, "max_cost_usd": 5.0}
+```
+
+- Kinds: `path_read` (Read/Grep/Glob and read-style shell commands), `path_write`
+  (Write/Edit, redirects, rm/mv/tee/cp destination), `path_any`, `net_exfil`
+  (curl/wget/nc/scp with a secret file, `@file`, or `base64 .env | curl`),
+  `rm_outside_project`, `force_push`, `pipe_to_shell`.
+- Actions: `deny` -> stderr reason, exit 2 (shown as BLOCKED). `ask` -> stdout
+  `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask",
+  "permissionDecisionReason":"..."}}`, exit 0, you get the prompt. `allow` -> log only.
+  If several rules match, deny beats ask beats allow.
+- Exceptions: `allow_paths`, `allow_agents` (agent name globs, from
+  `policy-check --agent NAME`) and `allow_commands` (globs on the full command)
+  each waive the rule on their own. An `allow` entry with several keys needs all
+  of them (e.g. `.env` in the project dir AND agent `deploy-bot`). `{project}`
+  means `$CLAUDE_PROJECT_DIR`. A waived call is logged as ALLOW with the rule.
+- `redact_output_note` is appended to the reason for ask/deny.
+- Safe `.env` reads: commands that only print variable names are allowed and
+  logged (`grep -o '^[A-Z_]*=' .env`, `cut -d= -f1 .env`,
+  `awk -F= '{print $1}' .env`, `sed 's/=.*//' .env`). Disable with
+  `"safe_env_read": false`.
+- Budget: `max_cost_usd` stays a deny. Costs come from ledger entries tagged
+  with the session id (`log --session ID --cost X`; the PostToolUse hook tags
+  automatically); blocked when the session total is greater than the cap.
+- No policy file: built-in strict defaults deny every secret-file touch. A
+  policy file without `rules` (the old `block_paths` keys) also keeps the
+  all-deny behavior.
+
+Decisions look like `policy:ASK Read .env -- Read of '.env' blocked by path
+rule '.env' (rule: secret-read) [session=abc]`. A malformed policy file fails
+closed (blocks). Unparseable hook input is allowed and recorded.
 
 **Heuristic, not a sandbox.** Shell parsing is best-effort: it splits on
 `; && || |`, resolves `~`, `$HOME` and relative paths, and pattern-matches
