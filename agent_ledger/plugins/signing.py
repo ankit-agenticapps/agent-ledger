@@ -6,6 +6,7 @@ sidecar. Keep the private key somewhere the agent cannot reach.
 import datetime
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -54,6 +55,11 @@ def cmd_keygen(args):
     if os.path.exists(key) and not args.force:
         print("error: %s already exists (use --force to replace)" % key)
         return 1
+    allowed = os.path.join(d, "allowed_signers")
+    if os.path.exists(allowed) and not args.force:
+        print("error: %s already exists (use --force to replace; this changes "
+              "who may sign)" % allowed)
+        return 1
     for p in (key, key + ".pub"):
         if os.path.exists(p):
             os.remove(p)
@@ -65,11 +71,19 @@ def cmd_keygen(args):
     os.chmod(key, 0o600)
     with open(key + ".pub") as f:
         parts = f.read().split()
-    allowed = os.path.join(d, "allowed_signers")
     with open(allowed, "w") as f:
         f.write('%s namespaces="%s" %s %s\n' % (PRINCIPAL, NAMESPACE, parts[0], parts[1]))
+    fp = key_fingerprint(key + ".pub")
+    if fp:
+        try:  # record the signer identity in the chain itself
+            core.append(core.default_path(getattr(args, "ledger", None)), "agent-ledger",
+                        "keygen: public key fingerprint=%s" % fp)
+        except (ValueError, OSError) as ex:
+            print("warning: could not record the fingerprint in the ledger: %s" % ex)
     print("private key:     %s (mode 0600)" % key)
     print("public key:      %s.pub" % key)
+    if fp:
+        print("fingerprint:     %s (recorded in the ledger chain)" % fp)
     print("allowed_signers: %s" % allowed)
     print()
     print("IMPORTANT: move the PRIVATE key off the agent's reach (another user,")
@@ -80,6 +94,59 @@ def cmd_keygen(args):
     return 0
 
 
+def key_fingerprint(path):
+    """SHA256:... fingerprint of a key file, or None."""
+    try:
+        r = _run(["ssh-keygen", "-l", "-f", path])
+    except OSError:
+        return None
+    parts = r.stdout.decode("utf-8", "replace").split()
+    return parts[1] if r.returncode == 0 and len(parts) > 1 and parts[1].startswith("SHA256:") else None
+
+
+def allowed_fingerprints(allowed):
+    """Fingerprints of every key listed in an allowed_signers file."""
+    out = []
+    try:
+        lines = open(allowed).read().splitlines()
+    except OSError:
+        return out
+    for ln in lines:
+        m = re.search(r"((?:ssh|ecdsa|sk)-[A-Za-z0-9@.\-]+)\s+([A-Za-z0-9+/=]+)", ln)
+        if not m or ln.lstrip().startswith("#"):
+            continue
+        with tempfile.TemporaryDirectory() as td:
+            tp = os.path.join(td, "k.pub")
+            with open(tp, "w") as f:
+                f.write("%s %s\n" % (m.group(1), m.group(2)))
+            fp = key_fingerprint(tp)
+        if fp:
+            out.append(fp)
+    return out
+
+
+FP_RE = re.compile(r"fingerprint=(SHA256:[A-Za-z0-9+/=]+)")
+
+
+def chain_pin(entries):
+    """(pinned_fp, all_fps_in_order, signing_enabled) from marker entries."""
+    fps, enabled = [], False
+    for e in entries:
+        act = str(e.get("action", ""))
+        if e.get("agent") != "agent-ledger":
+            continue
+        if act.startswith("signing:enabled") or act.startswith("keygen:"):
+            m = FP_RE.search(act)
+            if m:
+                fps.append(m.group(1))
+            enabled = True  # a recorded keygen or first signature means signatures are expected
+    return (fps[0] if fps else None), fps, enabled
+
+
+def is_marker(e):
+    return e.get("agent") == "agent-ledger" and str(e.get("action", "")).startswith("signing:enabled")
+
+
 def sign(ledger, key=None):
     """Sign the current head. Returns (ok, message)."""
     if not have_ssh_keygen():
@@ -87,12 +154,19 @@ def sign(ledger, key=None):
     key = os.path.abspath(os.path.expanduser(key)) if key else os.path.join(keys_dir(), "id_ed25519")
     if not os.path.exists(key):
         return False, "key not found: %s (run `agent-ledger keygen`)" % key
-    ok, line, why, n = core.verify(ledger)
+    ok, line, why, n = core.verify(ledger, check_state=True)
     if not ok:
         return False, "refusing to sign a broken chain (%s)" % why
     head, count = core.anchor(ledger)
     if count == 0:
         return False, "ledger is empty; nothing to sign"
+    fp = key_fingerprint(key)
+    pin, _, enabled = chain_pin(core.read(ledger))
+    st = core.read_state(ledger)
+    pin = pin or st.get("fingerprint")
+    if pin and fp and fp != pin:
+        return False, ("signing key fingerprint %s differs from the one pinned in "
+                       "the chain (%s); refusing" % (fp, pin))
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     r = _run(["ssh-keygen", "-Y", "sign", "-f", key, "-n", NAMESPACE],
              message(head, count, ts).encode("ascii"))
@@ -102,6 +176,14 @@ def sign(ledger, key=None):
            "signature": r.stdout.decode("ascii", "replace")}
     with open(sigs_path(ledger), "a") as f:
         f.write(json.dumps(rec, sort_keys=True, separators=(",", ":")) + "\n")
+    core.update_state(ledger, signing=True, fingerprint=pin or fp,
+                      max_signed_count=max(count, int(st.get("max_signed_count") or 0)))
+    if not enabled:  # first signature: record in the chain that signing is on
+        try:
+            core.append(ledger, "agent-ledger",
+                        "signing:enabled fingerprint=%s first_signed_count=%d" % (fp, count))
+        except (ValueError, OSError):
+            pass
     return True, "signed head %s (%d entries)" % (head[:12], count)
 
 
@@ -119,19 +201,25 @@ def read_sigs(ledger):
             for raw in f:
                 if raw.strip():
                     try:
-                        out.append(json.loads(raw))
+                        rec = json.loads(raw)
                     except ValueError:
-                        out.append({"_corrupt": True})
+                        rec = None
+                    out.append(rec if isinstance(rec, dict) else {"_corrupt": True})
     return out
 
 
-def check_signature(rec, allowed):
-    """Return True if the signature record is cryptographically valid."""
+FPOUT_RE = re.compile(r"key (SHA256:\S+)")
+
+
+def check_signature_fp(rec, allowed):
+    """Return (valid, signer_fingerprint_or_None)."""
     try:
         msg = message(rec["head"], int(rec["count"]), rec["ts"]).encode("ascii")
         sig = rec["signature"]
-    except (KeyError, TypeError, ValueError):
-        return False
+        if not isinstance(sig, str):
+            return False, None
+    except (KeyError, TypeError, ValueError, UnicodeError):
+        return False, None
     with tempfile.TemporaryDirectory() as td:
         sp = os.path.join(td, "s.sig")
         with open(sp, "w") as f:
@@ -141,21 +229,51 @@ def check_signature(rec, allowed):
                    "-n", NAMESPACE, "-s", sp]
         else:
             cmd = ["ssh-keygen", "-Y", "check-novalidate", "-n", NAMESPACE, "-s", sp]
-        return _run(cmd, msg).returncode == 0
+        r = _run(cmd, msg)
+    m = FPOUT_RE.search(r.stdout.decode("utf-8", "replace"))
+    return r.returncode == 0, (m.group(1) if m else None)
 
 
-def signature_status(ledger, allowed=None):
-    """Evaluate all signatures. Returns dict with per-record results."""
+def check_signature(rec, allowed):
+    """Return True if the signature record is cryptographically valid."""
+    return check_signature_fp(rec, allowed)[0]
+
+
+def signature_status(ledger, allowed=None, allow_rotation=False):
+    """Evaluate all signatures. Returns dict with per-record results and
+    chain-level `problems` (missing sigs file, swapped signer, rollback)."""
     entries = core.read(ledger)
     recs = read_sigs(ledger)
     allowed = allowed or os.path.join(keys_dir(), "allowed_signers")
+    state = core.read_state(ledger)
+    pin, fps, enabled = chain_pin(entries)
+    pin = pin or state.get("fingerprint")
+    enabled = enabled or bool(state.get("signing"))
+    problems = []
+    if len(set(fps)) > 1 and not allow_rotation:
+        problems.append("the chain records more than one signer fingerprint "
+                        "(%s); pass --allow-rotation if you rotated the key on purpose"
+                        % ", ".join(sorted(set(fps))))
+    if pin and os.path.exists(allowed):
+        have = allowed_fingerprints(allowed)
+        if pin not in have:
+            problems.append("allowed_signers does not contain the signer fingerprint "
+                            "recorded in the chain (%s): file swapped?" % pin)
+    if enabled and not recs:
+        problems.append("signing was set up but the signature file is missing or "
+                        "empty (%s): deleted or rolled back?" % sigs_path(ledger))
     results, last = [], None
     for i, rec in enumerate(recs):
         if rec.get("_corrupt"):
             results.append((rec, "unreadable record"))
             continue
-        if not check_signature(rec, allowed):
+        good, fp = check_signature_fp(rec, allowed)
+        if not good:
             results.append((rec, "BAD signature"))
+            continue
+        if pin and fp and fp != pin:
+            results.append((rec, "BAD signature: signed by a key that is not the "
+                            "signer pinned in the chain"))
             continue
         try:
             c = int(rec["count"])
@@ -169,37 +287,50 @@ def signature_status(ledger, allowed=None):
         results.append((rec, "ok"))
         if last is None or int(rec["count"]) > int(last["count"]):
             last = rec
+    seen = int(last["count"]) if last else 0
+    if (isinstance(state.get("max_signed_count"), int)
+            and state["max_signed_count"] > seen and recs):
+        problems.append("newest valid signature covers %d entries but %d were "
+                        "signed earlier (signature records removed: rollback)"
+                        % (seen, state["max_signed_count"]))
+    if enabled and recs and last is None:
+        problems.append("signing is set up but no signature in the file is valid")
+    tail = sum(1 for e in entries[seen:] if not is_marker(e))
     return {"results": results, "last": last, "total": len(entries),
+            "tail": tail, "problems": problems, "enabled": enabled, "pin": pin,
             "pinned": bool(os.path.exists(allowed)),
             "bad": sum(1 for _, s in results if s != "ok")}
 
 
-def report_signatures(ledger, allowed=None):
-    """Print signature check. Returns exit code (1 if any signature is bad)."""
+def report_signatures(ledger, allowed=None, allow_rotation=False):
+    """Print signature check. Returns exit code (1 if anything is wrong)."""
+    st0 = core.read_state(ledger)
     if not have_ssh_keygen():
         print("signatures: SKIPPED. " + MISSING)
-        return 0
-    st = signature_status(ledger, allowed)
+        return 1 if (st0.get("signing") or chain_pin(core.read(ledger))[2]) else 0
+    st = signature_status(ledger, allowed, allow_rotation)
     n = len(st["results"])
     if n == 0:
-        print("signatures: none found (%s)" % sigs_path(ledger))
+        print("signatures: none found (%s)%s" % (
+            sigs_path(ledger), "" if st["enabled"] else
+            " - signing was never set up, so nothing stops a full rewrite"))
     else:
         print("signatures: %d checked, %d valid, %d bad%s" % (
             n, n - st["bad"], st["bad"],
-            "" if st["pinned"] else " (no allowed_signers: key identity NOT pinned)"))
+            "" if st["pinned"] else " (no allowed_signers: key identity NOT pinned by "
+            "file%s)" % (", pinned by chain fingerprint" if st["pin"] else "")))
         for rec, status in st["results"]:
             if status != "ok":
                 print("  SIGNATURE FAIL (count=%s ts=%s): %s" % (
                     rec.get("count"), rec.get("ts"), status))
+    for pr in st["problems"]:
+        print("  SIGNATURE PROBLEM: %s" % pr)
     last = st["last"]
     if last:
         print("last signed point: entry %d at %s (head %s)" % (
             int(last["count"]), last["ts"], last["head"][:12]))
-        tail = st["total"] - int(last["count"])
-    else:
-        tail = st["total"]
-    print("unsigned tail: %d entries" % tail)
-    return 1 if st["bad"] else 0
+    print("unsigned tail: %d entries" % st["tail"])
+    return 1 if (st["bad"] or st["problems"]) else 0
 
 
 def _git(args, cwd=None):

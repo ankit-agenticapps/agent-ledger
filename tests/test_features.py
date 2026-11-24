@@ -36,10 +36,12 @@ class Base(unittest.TestCase):
         self.path = os.path.join(self.t, "l.jsonl")
         self.keys = os.path.join(self.t, "keys")
         os.environ["AGENT_LEDGER_KEYS"] = self.keys
+        os.environ["AGENT_LEDGER"] = os.path.join(self.t, "default.jsonl")
         os.environ["AGENT_LEDGER_POLICY"] = os.path.join(self.t, "policy.json")
 
     def tearDown(self):
         os.environ.pop("AGENT_LEDGER_KEYS", None)
+        os.environ.pop("AGENT_LEDGER", None)
         os.environ.pop("AGENT_LEDGER_POLICY", None)
         self.tmp.cleanup()
 
@@ -318,7 +320,8 @@ class PolicyTests(Base):
         self.assertTrue(core.verify(self.path)[0])
 
     def test_unparseable_input_allows_and_records(self):
-        code, _, _ = run("--ledger", self.path, "policy-check", stdin="not json")
+        code, _, _ = run("--ledger", self.path, "policy-check", "--fail-open",
+                          stdin="not json")
         self.assertEqual(code, 0)
         self.assertIn("ALLOW", core.read(self.path)[0]["action"])
 

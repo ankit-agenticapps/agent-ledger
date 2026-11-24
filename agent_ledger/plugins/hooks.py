@@ -1,11 +1,15 @@
 """hooks plugin: print ready-to-paste Claude Code hook JSON and a Codex wrapper."""
 import json
 
+# Every tool that can touch files, the shell, the network or sub-agents.
+MATCHER = ("Bash|Read|Write|Edit|MultiEdit|NotebookEdit|Glob|Grep|LS|WebFetch|Task"
+           "|mcp__.*")
+
 
 def run(args):
     cmd = args.cmd_name
     hook = {"hooks": {"PreToolUse": [{
-        "matcher": "Bash|Read|Write|Edit|MultiEdit|NotebookEdit|Glob|Grep",
+        "matcher": MATCHER,
         "hooks": [{"type": "command",
                    "command": "%s policy-check --agent claude-code" % cmd}]}],
         "PostToolUse": [{

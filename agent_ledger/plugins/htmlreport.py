@@ -30,33 +30,44 @@ def collect(ledger):
 
 def sig_info(ledger):
     recs = signing.read_sigs(ledger)
-    if not recs:
-        return {"state": "none", "records": [], "text": "no signatures"}
+    _pin, _fps, enabled = signing.chain_pin(core.read(ledger))
+    enabled = enabled or bool(core.read_state(ledger).get("signing"))
+    if not recs and not enabled:
+        return {"state": "none", "records": [], "problems": [],
+                "text": "no signatures (signing was never set up)"}
     if not signing.have_ssh_keygen():
-        return {"state": "skipped", "records": [],
+        return {"state": "bad" if enabled else "skipped", "records": [], "problems": [],
                 "text": "ssh-keygen missing: signatures not checked"}
     st = signing.signature_status(ledger)
     last = st["last"]
     recs_out = [{"count": r.get("count"), "head": r.get("head"), "ts": r.get("ts"),
                  "status": s} for r, s in st["results"]]
-    if st["bad"]:
+    if st["bad"] or st["problems"]:
         text = "%d signature(s) FAILED" % st["bad"]
+        if st["problems"]:
+            text += "; " + "; ".join(st["problems"])
         state = "bad"
     elif last:
         text = "signed through entry %d; unsigned tail: %d" % (
-            int(last["count"]), st["total"] - int(last["count"]))
+            int(last["count"]), st["tail"])
         state = "ok"
     else:
         text = "no valid signatures"
         state = "bad"
     return {"state": state, "records": recs_out, "text": text,
+            "problems": st["problems"],
             "last_count": int(last["count"]) if last else 0}
 
 
 def build(ledger):
-    data = {"entries": collect(ledger), "sigs": sig_info(ledger),
-            "genesis": core.GENESIS}
-    blob = json.dumps(data).replace("</", "<\\/").replace("<!--", "<\\!--")
+    entries = collect(ledger)
+    heads = [e["hash"] for e in entries if e.get("hash")]
+    data = {"entries": entries, "sigs": sig_info(ledger),
+            "genesis": core.GENESIS, "head": heads[-1] if heads else core.GENESIS,
+            "count": len(entries)}
+    # escape every '<' as \u003c: valid JSON, and neither "</script>" nor "<!--" can
+    # appear in the embedded blob (the old "<\\!--" escape was invalid JSON and blanked the page)
+    blob = json.dumps(data).replace("<", "\\u003c")
     return TEMPLATE.replace("__DATA__", blob)
 
 
@@ -78,6 +89,8 @@ main{max-width:980px;margin:0 auto;padding:16px}
 h1{font-size:20px;margin:4px 0 12px}
 #banner{padding:14px 16px;border-radius:8px;font-weight:600;border:1px solid var(--bd);background:var(--card)}
 #banner.ok{background:var(--okbg);color:var(--ok);border-color:var(--ok)}
+.warnbox:not(:empty){margin:8px 0;padding:10px 14px;border-radius:8px;font-weight:600;border:1px solid var(--warn);background:var(--warnbg);color:var(--warn)}
+#banner.warn{background:var(--warnbg);color:var(--warn);border-color:var(--warn)}
 #banner.bad{background:var(--badbg);color:var(--bad);border-color:var(--bad)}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:12px 0}
 .card{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:10px 12px}
@@ -102,6 +115,9 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
 </style></head><body><main>
 <h1>agent-ledger report</h1>
 <div id="banner">verifying chain...</div>
+<div id="anchorwarn" class="warnbox"></div>
+<div class="sigs" id="head"></div>
+<div class="bar"><label>Expected head hash (from a trusted copy): <input id="expect" size="66" placeholder="paste head hash to compare"></label></div>
 <div class="cards" id="cards"></div>
 <div class="sigs" id="sigs"></div>
 <div class="bar"><button id="vAgent" class="on">By agent</button><button id="vTime">Chronological</button></div>
@@ -110,7 +126,11 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
 <script id="d" type="application/json">__DATA__</script>
 <script>
 "use strict";
-var D=JSON.parse(document.getElementById("d").textContent);
+function failBanner(msg){var b=document.getElementById("banner");b.className="bad";
+ b.textContent="REPORT FAILED TO RENDER - do not trust this page: "+msg}
+window.onerror=function(m){failBanner(String(m));return false};
+if(window.addEventListener)window.addEventListener("unhandledrejection",function(e){failBanner(String(e.reason))});
+var D;try{D=JSON.parse(document.getElementById("d").textContent)}catch(x){failBanner("embedded data is unreadable ("+x+")");throw x}
 function sha256Fallback(s){
  var b=[],i;for(i=0;i<s.length;i++)b.push(s.charCodeAt(i)&255);
  var K=[],p=2,n=0;function pr(x){for(var j=2;j*j<=x;j++)if(x%j==0)return false;return true}
@@ -170,7 +190,7 @@ function render(){
  var out=document.getElementById("out");out.textContent="";
  var items=D.entries.filter(function(i){return i.e});
  if(view==="time"){items.forEach(function(i){out.appendChild(row(i))});return}
- var g={};items.forEach(function(i){(g[i.e.agent||"?"]=g[i.e.agent||"?"]||[]).push(i)});
+ var g=Object.create(null);items.forEach(function(i){var k=String(i.e.agent||"?");(g[k]=g[k]||[]).push(i)});
  Object.keys(g).sort().forEach(function(a){
   var d=el("details","agent");d.open=true;d.style.setProperty("--c",color(a));
   var cost=g[a].reduce(function(s,i){return s+(Number(i.e.cost)||0)},0);
@@ -183,9 +203,11 @@ verify().then(function(bad){
  var b=document.getElementById("banner");
  if(D.entries.length===0){b.textContent="Ledger is empty";}
  else if(bad){b.className="bad";b.textContent="Chain BROKEN at line "+bad.n+": "+bad.why}
+ else if(D.sigs.state==="bad"){b.className="bad";b.textContent="Chain is consistent but signatures FAILED: "+D.sigs.text}
  else{b.className="ok";b.textContent="Chain intact: "+D.entries.length+" entries re-verified in this browser (SHA-256)"}
- var items=D.entries.filter(function(i){return i.e}),agents={},cost=0,deny=0;
- items.forEach(function(i){agents[i.e.agent]=1;cost+=Number(i.e.cost)||0;if(isDeny(i.e))deny++});
+ if(D.entries.length&&D.sigs.state!=="ok"&&D.sigs.state!=="bad")document.getElementById("anchorwarn").textContent="UNVERIFIED AGAINST A TRUSTED ANCHOR: no valid signature. A fully rewritten chain looks identical in this report. Compare the head hash below with a copy you trust, or paste it in the box.";
+ var items=D.entries.filter(function(i){return i.e}),agents=Object.create(null),cost=0,deny=0;
+ items.forEach(function(i){agents[String(i.e.agent)]=1;cost+=Number(i.e.cost)||0;if(isDeny(i.e))deny++});
  var c=document.getElementById("cards");
  c.appendChild(card(D.entries.length,"entries"));
  c.appendChild(card(Object.keys(agents).length,"agents"));
@@ -194,8 +216,13 @@ verify().then(function(bad){
  c.appendChild(card(D.sigs.state==="ok"?"signed":D.sigs.state==="bad"?"FAILED":D.sigs.state==="skipped"?"unchecked":"none","signatures"));
  var s=document.getElementById("sigs");s.textContent="Signatures: "+D.sigs.text+
   (D.sigs.records.length?" ("+D.sigs.records.map(function(r){return"#"+r.count+" "+r.status}).join(", ")+")":"");
+ document.getElementById("head").textContent="Head hash: "+D.head+"  ("+D.count+" entries)";
+ var ex=document.getElementById("expect");
+ ex.oninput=function(){var v=ex.value.trim().toLowerCase();if(!v)return;
+  if(v===D.head){b.className=(bad?"bad":"ok");b.textContent="Head hash matches the expected value ("+D.count+" entries)"+(bad?" but the chain is BROKEN":"")}
+  else{b.className="bad";b.textContent="HEAD HASH DOES NOT MATCH the expected value: history was rewritten or truncated"}};
  render()
-});
+}).catch(function(x){failBanner(String(x))});
 document.getElementById("vAgent").onclick=function(){view="agent";this.className="on";document.getElementById("vTime").className="";render()};
 document.getElementById("vTime").onclick=function(){view="time";this.className="on";document.getElementById("vAgent").className="";render()};
 </script></body></html>

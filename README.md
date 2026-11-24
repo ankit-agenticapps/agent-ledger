@@ -137,21 +137,38 @@ Each rule has an `id`, a `kind`, an `action` and optional exceptions:
   all-deny behavior.
 
 Decisions look like `policy:ASK Read .env -- Read of '.env' blocked by path
-rule '.env' (rule: secret-read) [session=abc]`. A malformed policy file fails
-closed (blocks). Unparseable hook input is allowed and recorded.
+rule '.env' (rule: secret-read) [session=abc]`.
 
-**Heuristic, not a sandbox.** Shell parsing is best-effort: it splits on
-`; && || |`, resolves `~`, `$HOME` and relative paths, and pattern-matches
-`curl|sh`. It will miss obfuscation (`eval`, base64, a script that does the
-bad thing internally, variables other than `$HOME`, which it treats as
-unresolvable and blocks for `rm -rf`). Treat it as a strong guard rail against
-mistakes and casual misuse, and pair it with OS-level permissions for real
-isolation.
+**Fail-closed.** A malformed policy file, unusable hook input (empty, not JSON,
+wrong types, invalid UTF-8, over 1 MB) or any internal error blocks the call
+(exit 2) and is logged when the ledger can be written. If the ledger itself is
+corrupt, replaced or unwritable the call is also blocked, so auditing cannot be
+silently switched off. `policy-check --fail-open` restores the old "allow on
+error" behaviour (unsafe; documented opt-out).
+
+**Self-protection (not overridable by policy.json).** Writes to the policy file,
+the ledger, `.sigs`, `.state`, the keys folder and `allowed_signers`,
+`~/.agent-ledger`, `~/.claude/settings*.json`, `.claude/settings*.json` and
+`~/.claude/hooks` are denied for every tool and for shell commands; reads ask.
+Agents may not run `keygen`, `sign` or `policy init`.
+
+**Shell parsing is heuristic, not a sandbox.** It tokenises quotes, `$()`,
+backticks, `<()`, subshells, heredocs and wrappers (`sudo -u`, `env`, `timeout`,
+`xargs`, `bash -c`, `eval`), resolves `~`, `$HOME`, `$PWD`, simple variables and
+symlinks (realpath, case-insensitive), expands globs, and knows `rm`, `find
+-delete`, `rsync --delete`, `git clean`, `git push` force/mirror/delete forms and
+download-then-execute patterns. Anything it cannot parse or that is too long is
+reported as `complex-command` and asks a human. It still cannot see what a
+script does internally. See SECURITY.md.
 
 ## Commands
 
 - `log --agent NAME --action TEXT [--cost USD] [--files a,b] [--session ID]`
-- `verify [--anchor HASH] [--signatures] [--allowed-signers FILE]` exit 0 fine, 1 broken
+- `verify [--anchor HASH] [--min-entries N] [--signatures] [--allow-rotation] [--no-state] [--allowed-signers FILE]`
+  exit 0 fine, 1 broken. Also fails on truncation/rollback against the high-water
+  mark (`<ledger>.state`), back-dated or non-canonical lines, and with
+  `--signatures` on a missing sigs file after signing was set up, a swapped signer
+  (fingerprint is recorded in the chain by `keygen`/`sign`), or removed signatures
 - `report [--html OUT]` per-agent totals, or the HTML report
 - `anchor [--git]` print newest hash and count; optionally tag it in git
 - `keygen`, `sign [--key PATH]`
@@ -194,15 +211,27 @@ Drop a module with `register(subparsers)` into `agent_ledger/plugins/`. See
 
 ## Honest limits
 
-- The chain detects edits, deletions in the middle, and reordering. It does
-  not stop them; the policy hook stops only what its heuristics recognize.
-- Without a signature or anchor kept elsewhere, someone with write access can
-  rebuild the whole file from line one and it passes `verify`.
-- Removing the last entries leaves a valid chain; signed heads, `--anchor` and
-  git tags are what reveal it (and only for points you signed or anchored).
-- Same-user attackers can delete the signing key. Keep the private key
-  elsewhere.
-- The browser check re-computes hashes; it proves internal consistency of the
-  file you opened, not that the file is the original.
+Read SECURITY.md for the threat model. In short:
+
+- The chain detects edits, deletions, reordering, back-dating and (via the
+  `.state` high-water mark, `--min-entries`, `--anchor` and signed heads) most
+  truncation and rollback. It does not stop any of it.
+- **An attacker running as the same user can rewrite everything**: ledger, sigs,
+  `.state`, allowed_signers, policy and the Claude Code hook settings. The hook
+  refuses to help, but a process outside the hook (or a tool the hook does not
+  see) is not stopped. Only an external anchor (a head hash kept off-box, a git
+  tag pushed by another identity, a remote witness) or a signing key held by
+  another user or machine closes this.
+- A chain rebuilt from line one with the attacker's own key looks self-consistent;
+  the fingerprint pin only helps while the original `keygen`/`sign` entries are
+  still in the chain.
+- **Shell parsing is heuristic.** Obfuscation, scripts that do the bad thing
+  internally, `python script.py`, aliases and anything the lexer cannot judge
+  (it asks) can slip through. There is **no OS-level sandbox**: use OS
+  permissions, a separate user, containers or managed settings for real isolation.
+- The budget cap counts only costs that something reports; the shipped
+  PostToolUse hook logs cost 0.
+- The browser check proves internal consistency of the file you opened, not that
+  it is the original; compare the printed head hash with a trusted copy.
 
 Run tests: `python3 -m unittest discover -s tests`. Demo: `sh demo/demo.sh`.

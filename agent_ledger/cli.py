@@ -11,7 +11,9 @@ from .plugins import __path__ as _PLUGIN_PATH
 
 
 def ascii_safe(s):
-    return str(s).encode("ascii", "replace").decode("ascii")
+    """ASCII only, control characters (newline, ESC...) shown escaped."""
+    s = str(s).encode("ascii", "replace").decode("ascii")
+    return "".join(c if 32 <= ord(c) < 127 else "\\x%02x" % ord(c) for c in s)
 
 
 def _ledger(args):
@@ -37,10 +39,15 @@ def cmd_log(args):
     if not action:
         print("error: --action is required", file=sys.stderr)
         return 2
+    action = core.neutralize_tags(action)
+    if action.lstrip().lower().startswith(("keygen:", "signing:")):
+        print("error: action prefixes 'keygen:' and 'signing:' are reserved", file=sys.stderr)
+        return 0 if args.hook_stdin else 2
     if args.session:
         action += core.session_tag(args.session)
     try:
-        e = core.append(_ledger(args), args.agent, action, args.cost, files)
+        e = core.append(_ledger(args), args.agent, action, args.cost, files,
+                        session=args.session)
     except (ValueError, OSError) as ex:
         print("error: %s" % ex, file=sys.stderr)
         return 0 if args.hook_stdin else 2
@@ -49,7 +56,8 @@ def cmd_log(args):
 
 
 def cmd_verify(args):
-    ok, line, why, n = core.verify(_ledger(args), args.anchor)
+    ok, line, why, n = core.verify(_ledger(args), args.anchor, args.min_entries,
+                                   check_state=not args.no_state)
     if ok:
         print("VERIFY OK: %d entries, chain intact%s" % (
             n, ", anchor found" if args.anchor else ""))
@@ -61,7 +69,7 @@ def cmd_verify(args):
     if args.signatures:
         from .plugins import signing
         code = max(code, signing.report_signatures(
-            _ledger(args), args.allowed_signers))
+            _ledger(args), args.allowed_signers, args.allow_rotation))
     return code
 
 
@@ -165,6 +173,12 @@ def build_parser():
     p.add_argument("--anchor", help="also require this hash to be in the chain")
     p.add_argument("--signatures", action="store_true",
                    help="also check signed heads and report the unsigned tail")
+    p.add_argument("--min-entries", type=int, metavar="N",
+                   help="fail if the ledger has fewer than N entries (rollback guard)")
+    p.add_argument("--allow-rotation", action="store_true",
+                   help="accept more than one signer fingerprint in the chain")
+    p.add_argument("--no-state", action="store_true",
+                   help="skip the high-water-mark file check (.state next to the ledger)")
     p.add_argument("--allowed-signers", help="allowed_signers file (default: "
                    "~/.agent-ledger/keys/allowed_signers)")
     p.set_defaults(func=cmd_verify)
