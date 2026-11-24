@@ -30,11 +30,15 @@ def cmd_log(args):
             if ti.get("command"):
                 action += " " + str(ti["command"])[:120]
             files = ti.get("file_path") or files
+            if d.get("session_id") and not args.session:
+                args.session = d["session_id"]
         except Exception:
             action = action or "tool call"
     if not action:
         print("error: --action is required", file=sys.stderr)
         return 2
+    if args.session:
+        action += core.session_tag(args.session)
     try:
         e = core.append(_ledger(args), args.agent, action, args.cost, files)
     except (ValueError, OSError) as ex:
@@ -49,22 +53,40 @@ def cmd_verify(args):
     if ok:
         print("VERIFY OK: %d entries, chain intact%s" % (
             n, ", anchor found" if args.anchor else ""))
-        return 0
-    if line:
+    elif line:
         print("VERIFY FAIL at line %d: %s" % (line, why))
     else:
         print("VERIFY FAIL: %s" % why)
-    return 1
+    code = 0 if ok else 1
+    if args.signatures:
+        from .plugins import signing
+        code = max(code, signing.report_signatures(
+            _ledger(args), args.allowed_signers))
+    return code
 
 
 def cmd_anchor(args):
     h, n = core.anchor(_ledger(args))
     print("anchor: %s" % h)
     print("entries: %d" % n)
+    if args.git:
+        from .plugins import signing
+        ok, msg = signing.anchor_git(_ledger(args))
+        print(msg if ok else "git anchor skipped: " + msg)
+        return 0 if ok else 1
     return 0
 
 
 def cmd_report(args):
+    if args.html:
+        from .plugins import htmlreport
+        try:
+            htmlreport.write(_ledger(args), args.html)
+        except OSError as ex:
+            print("error: %s" % ex, file=sys.stderr)
+            return 2
+        print("wrote %s" % args.html)
+        return 0
     es = [e for e in core.read(_ledger(args)) if "agent" in e]
     if not es:
         print("Ledger is empty.")
@@ -134,18 +156,26 @@ def build_parser():
     p.add_argument("--action", help="what the agent did")
     p.add_argument("--cost", type=float, default=0.0, help="cost in USD")
     p.add_argument("--files", help="comma-separated file list")
+    p.add_argument("--session", help="session id (enables per-session budgets)")
     p.add_argument("--hook-stdin", action="store_true",
                    help="read a Claude Code hook JSON payload from stdin")
     p.set_defaults(func=cmd_log)
 
     p = sub.add_parser("verify", help="check the chain (exit 1 if broken)")
     p.add_argument("--anchor", help="also require this hash to be in the chain")
+    p.add_argument("--signatures", action="store_true",
+                   help="also check signed heads and report the unsigned tail")
+    p.add_argument("--allowed-signers", help="allowed_signers file (default: "
+                   "~/.agent-ledger/keys/allowed_signers)")
     p.set_defaults(func=cmd_verify)
 
     p = sub.add_parser("report", help="per-agent summary and recent actions")
+    p.add_argument("--html", metavar="OUT", help="write one self-contained HTML report")
     p.set_defaults(func=cmd_report)
 
     p = sub.add_parser("anchor", help="print latest hash to store elsewhere")
+    p.add_argument("--git", action="store_true",
+                   help="also write it into a local annotated git tag (no push)")
     p.set_defaults(func=cmd_anchor)
 
     load_plugins(sub)

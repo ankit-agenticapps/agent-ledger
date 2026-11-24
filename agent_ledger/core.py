@@ -162,3 +162,21 @@ def anchor(path=None):
     """Return (latest_hash, count). Empty ledger -> (GENESIS, 0)."""
     es = read(path)
     return (es[-1]["hash"] if es else GENESIS), len(es)
+
+
+def session_tag(session_id):
+    """Marker appended to an action so entries can be tied to one session."""
+    return " [session=%s]" % re.sub(r"[^A-Za-z0-9_.\-]", "_", str(session_id))[:64]
+
+
+def session_cost(path, session_id):
+    """Total cost of entries tagged with this session id."""
+    tag = session_tag(session_id)
+    total = 0.0
+    for e in read(path):
+        if tag in str(e.get("action", "")):
+            try:
+                total += float(e.get("cost") or 0)
+            except (TypeError, ValueError):
+                pass
+    return total

@@ -4,11 +4,15 @@ import json
 
 def run(args):
     cmd = args.cmd_name
-    hook = {"hooks": {"PostToolUse": [{
+    hook = {"hooks": {"PreToolUse": [{
+        "matcher": "Bash|Read|Write|Edit|MultiEdit|NotebookEdit|Glob|Grep",
+        "hooks": [{"type": "command",
+                   "command": "%s policy-check --agent claude-code" % cmd}]}],
+        "PostToolUse": [{
         "matcher": "Edit|Write|MultiEdit|Bash",
         "hooks": [{"type": "command",
                    "command": "%s log --agent claude-code --hook-stdin" % cmd}]}]}}
-    print("# Claude Code: merge into ~/.claude/settings.json")
+    print("# Claude Code: merge (PreToolUse = hard-block policy, PostToolUse = log) into ~/.claude/settings.json")
     print(json.dumps(hook, indent=2))
     print()
     print("# Codex: wrap each run (logs start and finish)")
